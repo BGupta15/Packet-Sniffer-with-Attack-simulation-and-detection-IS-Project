@@ -36,6 +36,6 @@ if __name__ == "__main__":
     send_port_scan()
     time.sleep(1)
     send_dns_tamper()
-    time.sleep(30)
+    time.sleep(1)
     send_syn_flood()
     print("All simulated traffic sent.")

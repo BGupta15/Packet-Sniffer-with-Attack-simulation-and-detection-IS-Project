@@ -1,3 +1,294 @@
+import asyncio
+import ipaddress
+import json
+import platform
+import socket
+import ssl
+import threading
+import time
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+import re
+import requests
+
+from scapy.all import (
+    AsyncSniffer,
+    ARP,
+    DNS,
+    DNSRR,
+    Ether,
+    IP,
+    TCP,
+    UDP,
+    get_if_addr,
+    get_if_list,
+    srp,
+    traceroute,
+)
+from tqdm import tqdm
+
+# Global variable
+captured_ips = set()
+results = {}
+ttl_data = {}
+mac_data = {}
+port_usage = defaultdict(int)
+
+arp_baseline = {}
+portscan_tracker = {}
+syn_counter = Counter()
+dns_records = {}
+alert_log_path = "alerts.log"
+alerts = []
+
+PORTSCAN_PORT_THRESHOLD = 20
+PORTSCAN_WINDOW = 30
+SYN_FLOOD_THRESHOLD = 80
+SYN_WINDOW = 5
+
+semaphore = asyncio.Semaphore(2)
+host_locks = defaultdict(lambda: asyncio.Semaphore(2))
+global_semaphore = asyncio.Semaphore(20)
+executor = ThreadPoolExecutor(max_workers=8)
+
+running_tasks = set()
+stop_event = asyncio.Event()
+_cleanup_thread_stop = threading.Event()
+
+
+# Utilities
+def log_alert(msg: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line)
+    alerts.append({"ts": ts, "msg": msg})
+    try:
+        with open(alert_log_path, "a") as af:
+            af.write(line + "\n")
+    except Exception:
+        pass
+
+
+def guess_os(ttl: int, hostname: str = "", open_ports: dict = None, mac: str = ""):
+    open_ports = open_ports or {}
+    hostname = hostname.lower()
+
+    # TTL-based
+    if ttl >= 250:
+        base_guess = "Router/IoT"
+    elif ttl >= 120:
+        base_guess = "Windows"
+    elif ttl >= 60:
+        base_guess = "Linux/Unix"
+    elif ttl > 0:
+        base_guess = "Embedded/Unknown"
+    else:
+        base_guess = "Unknown"
+
+    # Port-based
+    port_list = list(open_ports.keys())
+    if 135 in port_list or 139 in port_list or 445 in port_list:
+        return "Windows"
+    if 22 in port_list or 111 in port_list or 2049 in port_list:
+        return "Linux/Unix"
+    if 80 in port_list and 23 in port_list:
+        base_guess = "Router/IoT"
+
+    # Hostname hints
+    if re.search(r"(win|desktop|brinda)", hostname):
+        return "Windows"
+    if re.search(r"(ubuntu|debian|kali|raspberry|pi|linux|server)", hostname):
+        return "Linux/Unix"
+    if re.search(r"(router|dsl|lan|tplink|dlink|gateway|modem)", hostname):
+        return "Router/IoT"
+
+    # MAC vendor lookup 
+    if mac and mac != "Unknown":
+        try:
+            vendor = requests.get(f"https://api.macvendors.com/{mac}", timeout=5).text
+            if any(v in vendor.lower() for v in ["microsoft", "intel"]):
+                return "Windows"
+            if any(v in vendor.lower() for v in ["raspberry", "canon", "tp-link", "cisco"]):
+                return "Router/IoT"
+            if any(v in vendor.lower() for v in ["apple"]):
+                return "macOS/iOS"
+            if any(v in vendor.lower() for v in ["linux", "ubuntu"]):
+                return "Linux/Unix"
+        except Exception:
+            pass
+
+    return base_guess
+
+
+
+def reverse_dns(ip: str):
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except Exception:
+        return "Unknown"
+
+
+def geoip_lookup(ip: str):
+    try:
+        addr = ipaddress.ip_address(ip)
+        if addr.is_private:
+            return "Local"
+    except Exception:
+        pass
+    try:
+        res = requests.get(f"https://ipapi.co/{ip}/json", timeout=6)
+        data = res.json()
+        city = data.get("city") or ""
+        country = data.get("country_name") or ""
+        if city or country:
+            return ", ".join([s for s in (city, country) if s])
+        region = data.get("region") or data.get("country") or data.get("country_code")
+        if region:
+            return region
+        return "Unknown"
+    except Exception:
+        return "Unknown"
+
+
+
+def get_ssl_info(ip: str):
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((ip, 443), timeout=3) as sock:
+            with context.wrap_socket(sock, server_hostname=ip) as ssock:
+                cert = ssock.getpeercert()
+                cn = ""
+                issuer = ""
+                try:
+                    cn = cert.get("subject", [[("", "")]])[0][0][1]
+                except Exception:
+                    pass
+                try:
+                    issuer = cert.get("issuer", [[("", "")]])[0][0][1]
+                except Exception:
+                    pass
+                return {"CN": cn, "Issuer": issuer, "Expiry": cert.get("notAfter")}
+    except Exception:
+        return {}
+
+def _cleanup_worker():
+    while not _cleanup_thread_stop.is_set():
+        now = time.time()
+        for src in list(portscan_tracker.keys()):
+            entries = portscan_tracker.get(src, set())
+            portscan_tracker[src] = {(p, t) for (p, t) in entries if now - t <= PORTSCAN_WINDOW}
+            if not portscan_tracker[src]:
+                del portscan_tracker[src]
+        syn_counter.clear()
+        time.sleep(SYN_WINDOW)
+
+
+_cleanup_thread = threading.Thread(target=_cleanup_worker, daemon=True)
+_cleanup_thread.start()
+
+
+def detect_arp_spoof(pkt):
+    if ARP in pkt and pkt[ARP].op == 2: 
+        ip = pkt[ARP].psrc
+        mac = pkt[ARP].hwsrc
+        old = arp_baseline.get(ip)
+        if old and old != mac:
+            log_alert(f"ARP spoof suspected: {ip} previously {old}, now {mac}")
+        arp_baseline[ip] = mac
+
+
+def _is_syn(pkt):
+    try:
+        return pkt.haslayer(TCP) and (int(pkt[TCP].flags) & 0x02 != 0)
+    except Exception:
+        return False
+
+
+def detect_portscan(pkt):
+    if IP in pkt and _is_syn(pkt):
+        src = pkt[IP].src
+        dport = int(pkt[TCP].dport)
+        now = time.time()
+        entries = portscan_tracker.setdefault(src, set())
+        entries.add((dport, now))
+        unique_ports = {p for (p, _) in entries}
+        if len(unique_ports) >= PORTSCAN_PORT_THRESHOLD:
+            log_alert(f"Port scan suspected from {src} ({len(unique_ports)} unique ports in last {PORTSCAN_WINDOW}s)")
+
+
+def detect_syn_flood(pkt):
+    if IP in pkt and _is_syn(pkt):
+        src = pkt[IP].src
+        syn_counter[src] += 1
+        if syn_counter[src] >= SYN_FLOOD_THRESHOLD:
+            log_alert(f"SYN flood suspected from {src} ({syn_counter[src]} SYNs in last {SYN_WINDOW}s)")
+
+
+def detect_dns_tamper(pkt):
+    if pkt.haslayer(UDP) and int(pkt[UDP].sport) == 53 and pkt.haslayer(DNS) and pkt.haslayer(DNSRR):
+        try:
+            qname = pkt[DNS].qd.qname.decode() if pkt[DNS].qd else None
+            an = pkt[DNSRR]
+            try:
+                rdata = str(an.rdata)
+            except Exception:
+                rdata = repr(getattr(an, "rdata", None))
+            prev = dns_records.get(qname)
+            if prev and prev != rdata:
+                log_alert(f"DNS tamper suspected for {qname}: {prev} -> {rdata}")
+            dns_records[qname] = rdata
+        except Exception:
+            pass
+
+# Active scanning helpers (async)
+async def grab_banner(ip, port):
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=2)
+        try:
+            banner = await asyncio.wait_for(reader.read(1024), timeout=1)
+            return banner.decode(errors="ignore").strip()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    except Exception:
+        return "Unknown"
+
+
+async def scan_port(ip, port, timeout=1):
+    try:
+        conn = asyncio.open_connection(ip, port)
+        reader, writer = await asyncio.wait_for(conn, timeout=timeout)
+        writer.close()
+        await writer.wait_closed()
+        return port
+    except Exception:
+        return None
+
+
+async def scan_host_ports(ip, ports):
+    open_ports = {}
+    tasks = [scan_port(ip, port) for port in ports]
+    for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=f"Scanning {ip}", leave=True):
+        port = await f
+        if port:
+            try:
+                service = socket.getservbyport(port)
+            except Exception:
+                service = "unknown"
+            banner = await grab_banner(ip, port)
+            open_ports[port] = {"service": service, "banner": banner}
+            port_usage[port] += 1
+    return open_ports
+
+
+def run_traceroute(ip):
+    try:
+        res, _ = traceroute(ip, maxttl=10, verbose=False)
+        return [r[1].src for r in res]
+    except Exception:
+        return []
+
+
 def infer_cidr_from_iface(iface):
     try:
         ip = get_if_addr(iface)
@@ -8,10 +299,6 @@ def infer_cidr_from_iface(iface):
         pass
     return "192.168.43.0/24"
 
-
-# -----------------------------
-# Detection-only & passive helpers (sniff callbacks)
-# -----------------------------
 def detection_only_mode(iface):
     print("[*] Running detection-only (IDS) on interface:", iface)
 
@@ -35,7 +322,6 @@ def detection_only_mode(iface):
 
 def process_packet_factory(loop, ports, run_detectors=True, run_active_scans=True):
     def process_packet(pkt):
-        # Run detectors only if requested
         if run_detectors:
             try:
                 detect_arp_spoof(pkt)
@@ -44,14 +330,10 @@ def process_packet_factory(loop, ports, run_detectors=True, run_active_scans=Tru
                 detect_dns_tamper(pkt)
             except Exception:
                 pass
-
-        # If we are in any sniffing mode, we must process IPs
         if IP in pkt:
             for ip in [pkt[IP].src, pkt[IP].dst]:
                 if not ip:
                     continue
-                
-                # FIX: Add IP to captured_ips and log regardless of run_active_scans flag
                 if ip not in captured_ips:
                     print(f"[NEW IP FOUND] {ip}")
                     captured_ips.add(ip)
@@ -59,8 +341,6 @@ def process_packet_factory(loop, ports, run_detectors=True, run_active_scans=Tru
                         ttl_data[ip] = int(pkt[IP].ttl)
                     except Exception:
                         ttl_data[ip] = 0
-                    
-                    # Only create active scanning tasks if allowed
                     if run_active_scans:
                         coro = handle_ip(ip, ports)
 
@@ -80,7 +360,6 @@ def process_packet_factory(loop, ports, run_detectors=True, run_active_scans=Tru
 
 def passive_sniff(loop, interface, count, ports, run_detectors=True, run_active_scans=True):
     try:
-        # Note: run_detectors/run_active_scans flags control the behavior inside the prn callback
         process_packet = process_packet_factory(loop, ports, run_detectors, run_active_scans)
         kwargs = {"iface": interface, "prn": process_packet, "store": False}
         if isinstance(count, int) and count > 0:
@@ -98,23 +377,18 @@ async def handle_ip(ip, ports):
             print(f"\n[SCAN STARTED] {ip}")
             loop = asyncio.get_running_loop()
             hostname = await loop.run_in_executor(executor, reverse_dns, ip)
+            guessed_os = guess_os(ttl_data.get(ip, 0))
             mac = mac_data.get(ip, "Unknown")
-            guessed_os_initial = guess_os(ttl_data.get(ip, 0))
             geo = await loop.run_in_executor(executor, geoip_lookup, ip)
             ssl_info = {}
             if 443 in ports:
                 ssl_info = await loop.run_in_executor(executor, get_ssl_info, ip)
-            
             traceroute_path = await loop.run_in_executor(executor, run_traceroute, ip)
-            
             open_ports = await scan_host_ports(ip, ports)
-            
-            # Re-guess OS after port scanning provides more data
-            guessed_os_final = guess_os(ttl_data.get(ip, 0), hostname, open_ports, mac)
 
             results[ip] = {
                 "hostname": hostname,
-                "guessed_os": guessed_os_final,
+                "guessed_os": guessed_os,
                 "mac": mac,
                 "geoip": geo,
                 "ssl": ssl_info,
@@ -130,9 +404,6 @@ async def handle_ip(ip, ports):
             print(f"[SCAN COMPLETE] {ip}")
 
 
-# -----------------------------
-# Active ARP discovery mode
-# -----------------------------
 def arp_discovery(interface):
     print(f"[*] Sending ARP requests on {interface}...")
     ip_range = infer_cidr_from_iface(interface)
@@ -149,16 +420,12 @@ def arp_discovery(interface):
     for _, rcv in ans:
         ip = rcv.psrc
         mac = rcv.hwsrc
-        # Add IPs from ARP to captured_ips (used by scan tasks)
         captured_ips.add(ip)
         mac_data[ip] = mac
         ttl_data[ip] = 64
-        print(f"[ARP DISCOVERY] {ip} found.") # Log discovery
 
 
-# -----------------------------
-# Reporting helpers
-# -----------------------------
+
 def show_port_trends():
     print("\n[*] Port Activity Trend (most common open ports):")
     for port, count in sorted(port_usage.items(), key=lambda x: x[1], reverse=True):
@@ -171,9 +438,6 @@ def show_network_map():
         print(f"└── {ip} ({data.get('hostname')}) [{data.get('mac')}] → {data.get('guessed_os')}")
 
 
-# -----------------------------
-# Interactive menu & main loop
-# -----------------------------
 def choose_interface():
     ifaces = []
     try:
@@ -188,12 +452,14 @@ def choose_interface():
         print(f"  [{i}] {iface}")
     print("  [x] Enter custom interface name")
     while True:
-        choice = input("Select interface index (default loopback): ").strip()
+        choice = input("Select interface index (default loopback if unsure): ").strip()
         if choice == "":
+            # try to find a loopback-ish iface
             for candidate in ifaces:
                 if "Loopback" in candidate or "loopback" in candidate.lower() or candidate.lower().startswith("lo"):
                     print(f"Auto-selected interface: {candidate}")
                     return candidate
+            # fallback to first iface
             print(f"Auto-selected interface: {ifaces[0]}")
             return ifaces[0]
         if choice.lower() == "x":
@@ -216,9 +482,9 @@ def choose_mode():
     print("\nModes:")
     for i, m in enumerate(modes):
         desc = {
-            "passive": "Passive sniffing: discover IPs and (optionally) run active scans (No detectors)",
-            "arp": "ARP discovery: active scan discovered hosts (No detectors)",
-            "detect-only": "Detection-only (IDS): run detectors (No sniffing/scanning)",
+            "passive": "Passive sniffing: discover IPs from traffic and (optionally) perform active scans",
+            "arp": "ARP discovery: send ARP probes across inferred CIDR and actively scan discovered hosts",
+            "detect-only": "Detection-only (IDS): run detectors (ARP spoof, portscan, SYN flood, DNS tamper) without active scans",
         }[m]
         print(f"  [{i}] {m} - {desc}")
     while True:
@@ -238,66 +504,35 @@ async def menu_main():
     print("=== Interactive Packet Sniffer Menu ===")
     mode = choose_mode()
     iface = choose_interface()
-    
-    # --- Mode-dependent user input ---
-    pkt_count = 0
-    ports = []
-    run_active = False # Default to False, updated below
+    pkt_count = input("Packet count for passive sniffing (default 100): ").strip()
+    try:
+        pkt_count = int(pkt_count) if pkt_count else 100
+    except Exception:
+        pkt_count = 100
+    port_start = input("Start port for scans (default 20): ").strip()
+    port_end = input("End port for scans (default 1024): ").strip()
+    try:
+        ps = int(port_start) if port_start else 20
+        pe = int(port_end) if port_end else 1024
+    except Exception:
+        ps, pe = 20, 1024
 
-    if mode == "passive":
-        pkt_count = input("Packet count for passive sniffing (default 100): ").strip()
-        try:
-            pkt_count = int(pkt_count) if pkt_count else 100
-        except Exception:
-            pkt_count = 100
-        
-        # Ask if active scanning should run during passive mode
-        run_scan_choice = input("Run active port scans on discovered IPs? (y/N): ").strip().lower()
-        if run_scan_choice == 'y':
-            run_active = True
-            port_start = input("Start port for scans (default 20): ").strip()
-            port_end = input("End port for scans (default 1024): ").strip()
-            try:
-                ps = int(port_start) if port_start else 20
-                pe = int(port_end) if port_end else 1024
-            except Exception:
-                ps, pe = 20, 1024
-            ports = list(range(ps, pe + 1))
-        
-    elif mode == "arp":
-        run_active = True # ARP mode always runs active scans after discovery
-        port_start = input("Start port for scans (default 20): ").strip()
-        port_end = input("End port for scans (default 1024): ").strip()
-        try:
-            ps = int(port_start) if port_start else 20
-            pe = int(port_end) if port_end else 1024
-        except Exception:
-            ps, pe = 20, 1024
-        ports = list(range(ps, pe + 1))
-    
-    # --- Summary & Confirmation ---
+    ports = list(range(ps, pe + 1))
+
     print("\nSummary of choices:")
     print(f"  Mode: {mode}")
     print(f"  Interface: {iface}")
-    if mode == "passive":
-        print(f"  Packet count: {pkt_count}")
-        print(f"  Active Scanning: {'ON' if run_active else 'OFF'}")
-        if run_active:
-             print(f"  Port range: {len(ports)} ports")
-    elif mode == "arp":
-        print(f"  ARP Mode: Discovery + Scanning")
-        print(f"  Port range: {len(ports)} ports")
-        
+    print(f"  Packet count (passive sniff): {pkt_count}")
+    print(f"  Port range: {ps} - {pe} ({len(ports)} ports)")
     confirm = input("Proceed? (y/N): ").strip().lower()
     if confirm != "y":
         print("Aborted by user.")
         return
 
     loop = asyncio.get_running_loop()
-
-    # --- Cross-platform signal handling ---
     if platform.system() != "Windows":
         import signal as _sig
+
         for sig in (_sig.SIGINT, _sig.SIGTERM):
             try:
                 loop.add_signal_handler(sig, lambda s=sig: stop_event.set())
@@ -319,15 +554,9 @@ async def menu_main():
 
     sniffer = None
     try:
-        # ---------------------------------------------
-        # Mode Logic: Only ONE block executes
-        # ---------------------------------------------
         if mode == "passive":
-            print(f"[*] Passive sniffing started. Detectors: OFF. Active Scan: {'ON' if run_active else 'OFF'}.")
-            
-            # Use run_detectors=False to ensure no detector logic runs
-            sniffer = passive_sniff(loop, iface, pkt_count, ports, run_detectors=False, run_active_scans=run_active)
-            
+            print("[*] Passive sniffing started. Press Ctrl+C to stop.")
+            sniffer = passive_sniff(loop, iface, pkt_count, ports, run_detectors=False, run_active_scans=True)
             if isinstance(pkt_count, int) and pkt_count > 0:
                 try:
                     while sniffer and getattr(sniffer, "running", True):
@@ -336,59 +565,45 @@ async def menu_main():
                     pass
             else:
                 await stop_event.wait()
-
-            if running_tasks and run_active:
+            if running_tasks:
                 print("[*] Waiting up to 30s for active scan tasks to finish...")
                 try:
                     await asyncio.wait(list(running_tasks), timeout=30)
                 except Exception:
                     pass
-
         elif mode == "arp":
-            print("[*] ARP discovery + active scan mode. Detectors BLOCKED.")
-            # 1. Perform ARP discovery (synchronous)
-            arp_discovery(iface) 
-            
-            # 2. Launch scan tasks for discovered IPs
+            print("[*] ARP discovery + active scan mode.")
+            arp_discovery(iface)
             tasks = []
             for ip in list(captured_ips):
-                if ip not in results:
-                    coro = handle_ip(ip, ports)
-                    task = asyncio.create_task(coro)
-                    running_tasks.add(task)
-                    task.add_done_callback(lambda t: running_tasks.discard(t))
-                    tasks.append(task)
-            
-            # 3. Wait for all scans to finish
+                coro = handle_ip(ip, ports)
+                task = asyncio.create_task(coro)
+                running_tasks.add(task)
+                task.add_done_callback(lambda t: running_tasks.discard(t))
+                tasks.append(task)
             if tasks:
                 await asyncio.wait(tasks)
-
         elif mode == "detect-only":
-            print("[*] Detection-only mode is running. Sniffing is continuous, NO Active scanning is run.")
+            print("[*] Detection-only mode. Press Ctrl+C to stop.")
             sniffer = detection_only_mode(iface)
             await stop_event.wait()
-        
     except asyncio.CancelledError:
         pass
     finally:
-        # ---------------------------------------------
-        # Cleanup section runs regardless of mode choice
-        # ---------------------------------------------
         if sniffer:
             try:
                 sniffer.stop()
             except Exception:
                 pass
 
-        # polite cancellation of running tasks
-        for t in list(running_tasks):
-            try:
-                t.cancel()
-            except Exception:
-                pass
+    for t in list(running_tasks):
+        try:
+            t.cancel()
+        except Exception:
+            pass
 
-        _cleanup_thread_stop.set()
-        await asyncio.sleep(0.2)
+    _cleanup_thread_stop.set()
+    await asyncio.sleep(0.2)
 
     print(f"\n[*] Finished. {len(results)} IPs scanned (results saved to scan_results.json if any).")
     try:
