@@ -89,6 +89,7 @@ SYN Flood — 120 SYN packets to port 80
 Run this in one terminal while sniffer.py is running in detect-only mode on the same interface to verify the detectors fire correctly.
 
 # Architecture
+```
 sniffer.py
 ├── Passive sniff / ARP discovery          (scapy AsyncSniffer / srp)
 ├── handle_ip()                            (async per-host coordinator)
@@ -105,7 +106,7 @@ sniffer.py
     ├── detect_syn_flood()
     └── detect_dns_tamper()
 Concurrency is managed with asyncio semaphores (global_semaphore caps total concurrent host scans; host_locks prevents duplicate scans per IP). A background cleanup thread periodically clears the port-scan and SYN-flood sliding windows.
-
+```
 # Limitations & Notes
 
 * Root required — Raw socket capture needs elevated privileges on all platforms.
