@@ -2,16 +2,16 @@ A Python-based network reconnaissance and intrusion detection tool built with Sc
 
 # Features
 
-Passive Sniffing — Captures live traffic, discovers IPs, and optionally performs active scans on newly seen hosts
-ARP Discovery — Sends ARP probes across the inferred subnet CIDR to enumerate live hosts
-Detection-Only (IDS) Mode — Lightweight mode that runs threat detectors without any active scanning
-Port Scanner — Async TCP port scanner with banner grabbing and service identification
-OS Fingerprinting — Guesses OS from TTL, open ports, hostname patterns, and MAC vendor lookups
-GeoIP Lookup — Resolves public IPs to city/country using ipapi.co
-Reverse DNS — Resolves hostnames for discovered IPs
-SSL/TLS Inspection — Grabs certificate CN, issuer, and expiry from port 443
-Traceroute — Maps the network path to each discovered host
-Results Export — Saves full scan results to scan_results.json
+* Passive Sniffing — Captures live traffic, discovers IPs, and optionally performs active scans on newly seen hostsn
+* ARP Discovery — Sends ARP probes across the inferred subnet CIDR to enumerate live hosts
+* Detection-Only (IDS) Mode — Lightweight mode that runs threat detectors without any active scanning
+* Port Scanner — Async TCP port scanner with banner grabbing and service identification
+* OS Fingerprinting — Guesses OS from TTL, open ports, hostname patterns, and MAC vendor lookups
+* GeoIP Lookup — Resolves public IPs to city/country using ipapi.co
+* Reverse DNS — Resolves hostnames for discovered IPs
+* SSL/TLS Inspection — Grabs certificate CN, issuer, and expiry from port 443
+* Traceroute — Maps the network path to each discovered host
+* Results Export — Saves full scan results to scan_results.json
 
 # Threat Detectors
 DetectorWhat it catchesARP Spoof DetectionMAC address changes for a known IPPort Scan DetectionSource scanning ≥20 unique ports within 30 secondsSYN Flood DetectionSource sending ≥80 SYN packets within 5 secondsDNS Tamper DetectionDNS responses with changed rdata for a known query
@@ -106,13 +106,10 @@ sniffer.py
     └── detect_dns_tamper()
 Concurrency is managed with asyncio semaphores (global_semaphore caps total concurrent host scans; host_locks prevents duplicate scans per IP). A background cleanup thread periodically clears the port-scan and SYN-flood sliding windows.
 
-# Configuration (constants in sniffer.py)
-ConstantDefaultDescriptionPORTSCAN_PORT_THRESHOLD20Unique ports before scan alert firesPORTSCAN_WINDOW30 sRolling window for port scan detectionSYN_FLOOD_THRESHOLD80SYN count before flood alert firesSYN_WINDOW5 sRolling window for SYN flood detection
-
 # Limitations & Notes
 
-Root required — Raw socket capture needs elevated privileges on all platforms.
-Active scans are noisy — ARP and passive modes with active scanning enabled will generate TCP connect traffic to every discovered host. Use detect-only on production networks.
-MAC vendor lookups — OS fingerprinting calls api.macvendors.com; this will fail in air-gapped environments.
-GeoIP rate limits — ipapi.co has a free-tier limit of ~1,000 requests/day per IP.
-Windows support — Scapy on Windows requires Npcap and has reduced interface support.
+* Root required — Raw socket capture needs elevated privileges on all platforms.
+* Active scans are noisy — ARP and passive modes with active scanning enabled will generate TCP connect traffic to every discovered host. Use detect-only on production networks.
+* MAC vendor lookups — OS fingerprinting calls api.macvendors.com; this will fail in air-gapped environments.
+* GeoIP rate limits — ipapi.co has a free-tier limit of ~1,000 requests/day per IP.
+* Windows support — Scapy on Windows requires Npcap and has reduced interface support.
