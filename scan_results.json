@@ -1,0 +1,72 @@
+{
+    "192.168.1.1": {
+        "hostname": "dsldevice.lan",
+        "guessed_os": "Linux/Unix",
+        "mac": "e4:da:df:7a:f0:b0",
+        "geoip": "Local",
+        "ssl": {},
+        "traceroute": [
+            "192.168.1.1",
+            "192.168.1.1",
+            "192.168.1.1",
+            "192.168.1.1",
+            "192.168.1.1",
+            "192.168.1.1",
+            "192.168.1.1",
+            "192.168.1.1",
+            "192.168.1.1",
+            "192.168.1.1"
+        ],
+        "open_ports": {
+            "443": {
+                "service": "https",
+                "banner": "Unknown"
+            },
+            "80": {
+                "service": "http",
+                "banner": "Unknown"
+            }
+        }
+    },
+    "192.168.1.8": {
+        "hostname": "Brinda",
+        "guessed_os": "Linux/Unix",
+        "mac": "60:e9:aa:a1:d5:73",
+        "geoip": "Local",
+        "ssl": {},
+        "traceroute": [
+            "192.168.1.8",
+            "192.168.1.8",
+            "192.168.1.8",
+            "192.168.1.8",
+            "192.168.1.8",
+            "192.168.1.8",
+            "192.168.1.8",
+            "192.168.1.8",
+            "192.168.1.8",
+            "192.168.1.8"
+        ],
+        "open_ports": {
+            "80": {
+                "service": "http",
+                "banner": "Unknown"
+            },
+            "443": {
+                "service": "https",
+                "banner": "Unknown"
+            },
+            "445": {
+                "service": "microsoft-ds",
+                "banner": "Unknown"
+            },
+            "135": {
+                "service": "epmap",
+                "banner": "Unknown"
+            },
+            "139": {
+                "service": "netbios-ssn",
+                "banner": "Unknown"
+            }
+        }
+    }
+}

@@ -1,0 +1,6 @@
+scapy
+requests
+tqdm
+fastapi
+uvicorn
+wmi
